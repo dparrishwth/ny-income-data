@@ -12,6 +12,7 @@ type SocrataResponse = {
     view?: {
       columns?: SocrataColumn[];
     };
+    fetchedColumns?: SocrataColumn[];
   };
 };
 
@@ -75,16 +76,25 @@ function sanitizeValue(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+function normalizeColumnKey(column: SocrataColumn, index: number): string {
+  const rawKey = column.fieldName || column.name || `col_${index}`;
+  return rawKey.replace(/"/g, "");
+}
+
 function mapRows(response: SocrataResponse): Record<string, any>[] {
-  const columns = response.meta?.view?.columns ?? [];
-  return (response.data ?? []).map((row: any) => {
+  const columns = response.meta?.fetchedColumns ?? response.meta?.view?.columns ?? [];
+  const rows = response.data ?? [];
+
+  return rows.map((row: any) => {
+    if (row && typeof row === "object" && !Array.isArray(row)) {
+      return row;
+    }
+
     const record: Record<string, any> = {};
     columns.forEach((column, index) => {
-      const key = (column.name || column.fieldName || `col_${index}`).replace(/"/g, "");
+      const key = normalizeColumnKey(column, index);
       if (Array.isArray(row)) {
         record[key] = row[index];
-      } else if (row && typeof row === "object") {
-        record[key] = row[column.fieldName ?? key];
       }
     });
     return record;
@@ -181,7 +191,12 @@ export async function GET(req: NextRequest) {
       const rows = mapRows(rawResponse);
       const csvLines = ["year,program,claimed,used,taxpayer_type"];
       for (const row of rows) {
-        const values = [row.year, row.program, row.claimed, row.used, row.taxpayer_type]
+        const yearValue = row.year ?? row[columns.year];
+        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
+        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
+        const usedValue = row.used ?? (columns.used ? row[columns.used] : undefined);
+        const taxpayerValue = row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined);
+        const values = [yearValue, programValue, claimedValue, usedValue, taxpayerValue]
           .map((value) => {
             if (value === null || value === undefined) return "";
             const stringValue = String(value);
@@ -235,9 +250,12 @@ export async function GET(req: NextRequest) {
     ]);
 
     const yearlyRows = mapRows(yearlyResponse).map((row) => {
-      const year = Number.parseInt(String(row.year), 10);
-      const claimed = toNumber(row.claimed);
-      const used = toNumber(row.used);
+      const yearValue = row.year ?? row[columns.year];
+      const claimedValue = row.claimed ?? row[columns.claimed ?? "claimed"];
+      const usedValue = row.used ?? row[columns.used ?? "used"];
+      const year = Number.parseInt(String(yearValue), 10);
+      const claimed = toNumber(claimedValue);
+      const used = toNumber(usedValue);
       return {
         year,
         claimed,
@@ -253,18 +271,22 @@ export async function GET(req: NextRequest) {
 
     const topProgramRows = topProgramsResponse ? mapRows(topProgramsResponse) : [];
     const topPrograms = topProgramRows
-      .map((row) => ({ program: row.program ?? "Unknown", claimed: toNumber(row.claimed) }))
+      .map((row) => {
+        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
+        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
+        return { program: programValue ?? "Unknown", claimed: toNumber(claimedValue) };
+      })
       .filter((row) => row.program !== null && row.program !== undefined);
 
     const programOptions = programsResponse
       ? mapRows(programsResponse)
-          .map((row) => row.program)
+          .map((row) => row.program ?? (columns.program ? row[columns.program] : undefined))
           .filter((value) => value !== null && value !== undefined && value !== "")
       : [];
 
     const taxpayerOptions = taxpayerTypesResponse
       ? mapRows(taxpayerTypesResponse)
-          .map((row) => row.taxpayer_type)
+          .map((row) => row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined))
           .filter((value) => value !== null && value !== undefined && value !== "")
       : [];
 
@@ -274,14 +296,20 @@ export async function GET(req: NextRequest) {
       const rawQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
       const rawResponse = await socrataQuery<SocrataResponse>(rawQuery);
       rawRows = mapRows(rawResponse).map((row) => {
-        const claimed = toNumber(row.claimed);
-        const used = toNumber(row.used);
+        const yearValue = row.year ?? row[columns.year];
+        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
+        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
+        const usedValue = row.used ?? (columns.used ? row[columns.used] : undefined);
+        const taxpayerValue =
+          row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined);
+        const claimed = toNumber(claimedValue);
+        const used = toNumber(usedValue);
         return {
-          year: row.year,
-          program: row.program,
+          year: yearValue,
+          program: programValue,
           claimed,
           used,
-          taxpayer_type: row.taxpayer_type,
+          taxpayer_type: taxpayerValue,
           utilizationPct: computeUtilization(claimed, used),
         };
       });
