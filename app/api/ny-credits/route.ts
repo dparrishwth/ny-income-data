@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { socrataQuery } from "@/lib/socrataV3";
+import { fetchSocrataMetadata, socrataQuery } from "@/lib/socrataV3";
 
 type SocrataColumn = {
   fieldName?: string;
@@ -14,6 +14,10 @@ type SocrataResponse = {
     };
     fetchedColumns?: SocrataColumn[];
   };
+};
+
+type SocrataViewMetadata = {
+  columns?: SocrataColumn[];
 };
 
 type ColumnMap = {
@@ -37,8 +41,8 @@ async function getColumnMap(): Promise<ColumnMap> {
     return cachedColumnMap;
   }
 
-  const response = await socrataQuery<SocrataResponse>("SELECT * LIMIT 1");
-  const columns = response.meta?.view?.columns ?? [];
+  const metadata = await fetchSocrataMetadata<SocrataViewMetadata>();
+  const columns = metadata.columns ?? [];
 
   const findColumn = (regex: RegExp): string | undefined => {
     return columns.find((column) => {
@@ -60,14 +64,6 @@ async function getColumnMap(): Promise<ColumnMap> {
     throw new Error("Unable to identify year column in Socrata dataset");
   }
 
-  if (!columnMap.claimed) {
-    throw new Error("Unable to identify claimed amount column in Socrata dataset");
-  }
-
-  if (!columnMap.program) {
-    throw new Error("Unable to identify program column in Socrata dataset");
-  }
-
   cachedColumnMap = columnMap;
   return columnMap;
 }
@@ -81,7 +77,10 @@ function normalizeColumnKey(column: SocrataColumn, index: number): string {
   return rawKey.replace(/"/g, "");
 }
 
-function mapRows(response: SocrataResponse): Record<string, any>[] {
+function mapRows(response: SocrataResponse | Record<string, any>[]): Record<string, any>[] {
+  if (Array.isArray(response)) {
+    return response.map((row) => ({ ...row }));
+  }
   const columns = response.meta?.fetchedColumns ?? response.meta?.view?.columns ?? [];
   const rows = response.data ?? [];
 
@@ -187,7 +186,7 @@ export async function GET(req: NextRequest) {
     if (params.format === "csv") {
       const rawSelect = buildRawSelect(columns);
       const csvQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
-      const rawResponse = await socrataQuery<SocrataResponse>(csvQuery);
+      const rawResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(csvQuery);
       const rows = mapRows(rawResponse);
       const csvLines = ["year,program,claimed,used,taxpayer_type"];
       for (const row of rows) {
@@ -243,10 +242,16 @@ export async function GET(req: NextRequest) {
       : undefined;
 
     const [yearlyResponse, topProgramsResponse, programsResponse, taxpayerTypesResponse] = await Promise.all([
-      socrataQuery<SocrataResponse>(yearlyQuery),
-      topProgramsQuery ? socrataQuery<SocrataResponse>(topProgramsQuery) : Promise.resolve(null),
-      programsQuery ? socrataQuery<SocrataResponse>(programsQuery) : Promise.resolve(null),
-      taxpayerTypesQuery ? socrataQuery<SocrataResponse>(taxpayerTypesQuery) : Promise.resolve(null),
+      socrataQuery<SocrataResponse | Record<string, any>[]>(yearlyQuery),
+      topProgramsQuery
+        ? socrataQuery<SocrataResponse | Record<string, any>[]>(topProgramsQuery)
+        : Promise.resolve(null),
+      programsQuery
+        ? socrataQuery<SocrataResponse | Record<string, any>[]>(programsQuery)
+        : Promise.resolve(null),
+      taxpayerTypesQuery
+        ? socrataQuery<SocrataResponse | Record<string, any>[]>(taxpayerTypesQuery)
+        : Promise.resolve(null),
     ]);
 
     const yearlyRows = mapRows(yearlyResponse).map((row) => {
@@ -294,7 +299,7 @@ export async function GET(req: NextRequest) {
     if (params.view === "raw") {
       const rawSelect = buildRawSelect(columns);
       const rawQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
-      const rawResponse = await socrataQuery<SocrataResponse>(rawQuery);
+      const rawResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(rawQuery);
       rawRows = mapRows(rawResponse).map((row) => {
         const yearValue = row.year ?? row[columns.year];
         const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
