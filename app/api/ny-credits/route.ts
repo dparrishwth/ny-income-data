@@ -30,31 +30,50 @@ type ColumnMap = {
 
 let cachedColumnMap: ColumnMap | null = null;
 
-const YEAR_REGEX = /(calendar|tax).*year/i;
-const CLAIMED_REGEX = /(claimed|amount|value|approved)/i;
-const USED_REGEX = /(used|utilized|applied)/i;
-const PROGRAM_REGEX = /(program|credit.*name|credit.*type|description)/i;
-const TAXPAYER_REGEX = /(taxpayer|entity).*type/i;
+const YEAR_PATTERNS = [
+  /(calendar|tax|fiscal).*year/i,
+  /(reporting|taxable).*year/i,
+  /^year$/i,
+  /year/i,
+];
+const CLAIMED_PATTERNS = [
+  /(claimed|amount|value|approved)/i,
+  /(total|sum).*claimed/i,
+];
+const USED_PATTERNS = [
+  /(used|utilized|applied)/i,
+  /(amount|value).*used/i,
+];
+const PROGRAM_PATTERNS = [
+  /(program|credit.*name|credit.*type|description)/i,
+  /(program|credit).*title/i,
+];
+const TAXPAYER_PATTERNS = [
+  /(taxpayer|entity).*type/i,
+  /(applicant|organization).*type/i,
+];
 
 function findColumnFromList(
   candidates: (SocrataColumn | string)[],
-  regex: RegExp,
+  patterns: RegExp[],
 ): string | undefined {
-  for (const candidate of candidates) {
-    if (typeof candidate === "string") {
-      if (regex.test(candidate)) {
-        return candidate;
+  for (const pattern of patterns) {
+    for (const candidate of candidates) {
+      if (typeof candidate === "string") {
+        if (pattern.test(candidate)) {
+          return candidate;
+        }
+        continue;
       }
-      continue;
-    }
 
-    const fieldName = candidate.fieldName ?? "";
-    const name = candidate.name ?? "";
-    if (regex.test(fieldName)) {
-      return fieldName;
-    }
-    if (regex.test(name)) {
-      return candidate.fieldName ?? name;
+      const fieldName = candidate.fieldName ?? "";
+      const name = candidate.name ?? "";
+      if (pattern.test(fieldName)) {
+        return fieldName;
+      }
+      if (pattern.test(name)) {
+        return candidate.fieldName ?? name;
+      }
     }
   }
   return undefined;
@@ -74,11 +93,11 @@ async function getColumnMap(): Promise<ColumnMap> {
   }
 
   const columnMap: ColumnMap = {
-    year: findColumnFromList(columns, YEAR_REGEX) ?? "",
-    claimed: findColumnFromList(columns, CLAIMED_REGEX),
-    used: findColumnFromList(columns, USED_REGEX),
-    program: findColumnFromList(columns, PROGRAM_REGEX),
-    taxpayerType: findColumnFromList(columns, TAXPAYER_REGEX),
+    year: findColumnFromList(columns, YEAR_PATTERNS) ?? "",
+    claimed: findColumnFromList(columns, CLAIMED_PATTERNS),
+    used: findColumnFromList(columns, USED_PATTERNS),
+    program: findColumnFromList(columns, PROGRAM_PATTERNS),
+    taxpayerType: findColumnFromList(columns, TAXPAYER_PATTERNS),
   };
 
   const needsFallback = !columnMap.year || !columnMap.claimed || !columnMap.used || !columnMap.program;
@@ -92,12 +111,12 @@ async function getColumnMap(): Promise<ColumnMap> {
       const sampleColumns = sampleRows.length > 0 ? Object.keys(sampleRows[0]) : [];
 
       const fallbackMap: ColumnMap = {
-        year: columnMap.year || findColumnFromList(sampleColumns, YEAR_REGEX) || "",
-        claimed: columnMap.claimed || findColumnFromList(sampleColumns, CLAIMED_REGEX),
-        used: columnMap.used || findColumnFromList(sampleColumns, USED_REGEX),
-        program: columnMap.program || findColumnFromList(sampleColumns, PROGRAM_REGEX),
+        year: columnMap.year || findColumnFromList(sampleColumns, YEAR_PATTERNS) || "",
+        claimed: columnMap.claimed || findColumnFromList(sampleColumns, CLAIMED_PATTERNS),
+        used: columnMap.used || findColumnFromList(sampleColumns, USED_PATTERNS),
+        program: columnMap.program || findColumnFromList(sampleColumns, PROGRAM_PATTERNS),
         taxpayerType:
-          columnMap.taxpayerType || findColumnFromList(sampleColumns, TAXPAYER_REGEX),
+          columnMap.taxpayerType || findColumnFromList(sampleColumns, TAXPAYER_PATTERNS),
       };
 
       Object.assign(columnMap, fallbackMap);
