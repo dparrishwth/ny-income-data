@@ -36,29 +36,75 @@ const USED_REGEX = /(used|utilized|applied)/i;
 const PROGRAM_REGEX = /(program|credit.*name|credit.*type|description)/i;
 const TAXPAYER_REGEX = /(taxpayer|entity).*type/i;
 
+function findColumnFromList(
+  candidates: (SocrataColumn | string)[],
+  regex: RegExp,
+): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") {
+      if (regex.test(candidate)) {
+        return candidate;
+      }
+      continue;
+    }
+
+    const fieldName = candidate.fieldName ?? "";
+    const name = candidate.name ?? "";
+    if (regex.test(fieldName)) {
+      return fieldName;
+    }
+    if (regex.test(name)) {
+      return candidate.fieldName ?? name;
+    }
+  }
+  return undefined;
+}
+
 async function getColumnMap(): Promise<ColumnMap> {
   if (cachedColumnMap) {
     return cachedColumnMap;
   }
 
-  const metadata = await fetchSocrataMetadata<SocrataViewMetadata>();
-  const columns = metadata.columns ?? [];
-
-  const findColumn = (regex: RegExp): string | undefined => {
-    return columns.find((column) => {
-      const fieldName = column.fieldName ?? "";
-      const name = column.name ?? "";
-      return regex.test(fieldName) || regex.test(name);
-    })?.fieldName;
-  };
+  let columns: SocrataColumn[] = [];
+  try {
+    const metadata = await fetchSocrataMetadata<SocrataViewMetadata>();
+    columns = metadata.columns ?? [];
+  } catch (error) {
+    console.warn("Unable to load Socrata metadata", error);
+  }
 
   const columnMap: ColumnMap = {
-    year: findColumn(YEAR_REGEX) ?? "",
-    claimed: findColumn(CLAIMED_REGEX),
-    used: findColumn(USED_REGEX),
-    program: findColumn(PROGRAM_REGEX),
-    taxpayerType: findColumn(TAXPAYER_REGEX),
+    year: findColumnFromList(columns, YEAR_REGEX) ?? "",
+    claimed: findColumnFromList(columns, CLAIMED_REGEX),
+    used: findColumnFromList(columns, USED_REGEX),
+    program: findColumnFromList(columns, PROGRAM_REGEX),
+    taxpayerType: findColumnFromList(columns, TAXPAYER_REGEX),
   };
+
+  const needsFallback = !columnMap.year || !columnMap.claimed || !columnMap.used || !columnMap.program;
+
+  if (needsFallback) {
+    try {
+      const sampleResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(
+        "SELECT * LIMIT 1",
+      );
+      const sampleRows = mapRows(sampleResponse);
+      const sampleColumns = sampleRows.length > 0 ? Object.keys(sampleRows[0]) : [];
+
+      const fallbackMap: ColumnMap = {
+        year: columnMap.year || findColumnFromList(sampleColumns, YEAR_REGEX) || "",
+        claimed: columnMap.claimed || findColumnFromList(sampleColumns, CLAIMED_REGEX),
+        used: columnMap.used || findColumnFromList(sampleColumns, USED_REGEX),
+        program: columnMap.program || findColumnFromList(sampleColumns, PROGRAM_REGEX),
+        taxpayerType:
+          columnMap.taxpayerType || findColumnFromList(sampleColumns, TAXPAYER_REGEX),
+      };
+
+      Object.assign(columnMap, fallbackMap);
+    } catch (error) {
+      console.warn("Unable to infer columns from sample Socrata row", error);
+    }
+  }
 
   if (!columnMap.year) {
     throw new Error("Unable to identify year column in Socrata dataset");

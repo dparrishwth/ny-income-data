@@ -1,6 +1,6 @@
 const DATASET_ID = "qjqv-zrwt";
-const V3_BASE_URL = `https://data.ny.gov/api/v3/views/${DATASET_ID}/query.json`;
 const SOQL_BASE_URL = `https://data.ny.gov/resource/${DATASET_ID}.json`;
+const V3_BASE_URL = `https://data.ny.gov/api/v3/views/${DATASET_ID}/query.json`;
 
 function buildHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
@@ -28,35 +28,34 @@ async function fetchJson(url: string, headers: Record<string, string>) {
 
 export async function socrataQuery<T>(query: string): Promise<T> {
   const headers = buildHeaders();
-  const v3Url = `${V3_BASE_URL}?query=${encodeURIComponent(query)}`;
+  const soqlUrl = `${SOQL_BASE_URL}?$query=${encodeURIComponent(query)}`;
 
   try {
-    return (await fetchJson(v3Url, headers)) as T;
-  } catch (error) {
-    const status = typeof error === "object" && error && "status" in error ? (error as any).status : 0;
-    const hasToken = Boolean(headers["X-App-Token"]);
-    if (status && status !== 401 && status !== 403) {
-      throw new Error(`Socrata request failed (${status}): ${(error as Error).message}`);
-    }
+    return (await fetchJson(soqlUrl, headers)) as T;
+  } catch (primaryError) {
+    const primaryStatus =
+      typeof primaryError === "object" && primaryError && "status" in primaryError
+        ? (primaryError as any).status
+        : 0;
 
-    if (status && (status === 401 || status === 403) && !hasToken) {
-      const soqlUrl = `${SOQL_BASE_URL}?$query=${encodeURIComponent(query)}`;
-      try {
-        return (await fetchJson(soqlUrl, headers)) as T;
-      } catch (fallbackError) {
-        const fallbackStatus =
-          typeof fallbackError === "object" && fallbackError && "status" in fallbackError
-            ? (fallbackError as any).status
-            : 0;
-        throw new Error(
-          `Socrata request failed (${status}) without an app token and fallback query failed (${fallbackStatus}): ${(
-            fallbackError as Error
-          ).message}`,
-        );
-      }
-    }
+    const v3Url = `${V3_BASE_URL}?query=${encodeURIComponent(query)}`;
+    try {
+      return (await fetchJson(v3Url, headers)) as T;
+    } catch (fallbackError) {
+      const fallbackStatus =
+        typeof fallbackError === "object" && fallbackError && "status" in fallbackError
+          ? (fallbackError as any).status
+          : 0;
 
-    throw new Error(`Socrata request failed (${status || "unknown"}): ${(error as Error).message}`);
+      const primaryMessage = (primaryError as Error).message || "Unknown error";
+      const fallbackMessage = (fallbackError as Error).message || "Unknown error";
+
+      throw new Error(
+        `Socrata request failed (${primaryStatus || "unknown"}): ${primaryMessage}. Fallback request failed (${
+          fallbackStatus || "unknown"
+        }): ${fallbackMessage}`,
+      );
+    }
   }
 }
 
