@@ -241,6 +241,73 @@ function buildRawSelect(columns: ColumnMap): string {
   return `SELECT "${columns.year}" AS year, ${programExpr} AS program, ${claimedExpr} AS claimed, ${usedExpr} AS used, ${taxpayerExpr} AS taxpayer_type`;
 }
 
+type NormalizedRow = {
+  year: number | string;
+  program: string;
+  claimed: number;
+  used: number;
+  taxpayer_type?: string;
+  utilizationPct: number;
+};
+
+function normalizeRow(row: Record<string, any>, columns: ColumnMap): NormalizedRow {
+  const yearValue = row.year ?? row[columns.year];
+  const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
+  const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
+  const usedValue = row.used ?? (columns.used ? row[columns.used] : undefined);
+  const taxpayerValue =
+    row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined);
+
+  const claimed = toNumber(claimedValue);
+  const used = toNumber(usedValue);
+  const yearNumber = typeof yearValue === "number" ? yearValue : Number.parseInt(String(yearValue), 10);
+
+  return {
+    year: Number.isFinite(yearNumber) ? yearNumber : yearValue ?? "Unknown",
+    program: programValue ? String(programValue) : "Unknown",
+    claimed,
+    used,
+    taxpayer_type: taxpayerValue ? String(taxpayerValue) : undefined,
+    utilizationPct: computeUtilization(claimed, used),
+  };
+}
+
+function buildYearRange(years: number[]): number[] {
+  if (!years.length) {
+    return [];
+  }
+
+  const minYear = Math.min(...years);
+  const maxYear = Math.max(...years);
+  const range: number[] = [];
+
+  for (let year = minYear; year <= maxYear; year += 1) {
+    range.push(year);
+  }
+
+  return range;
+}
+
+function rowsToCsv(rows: NormalizedRow[]): string {
+  const csvLines = ["year,program,claimed,used,taxpayer_type"];
+
+  for (const row of rows) {
+    const values = [row.year, row.program, row.claimed, row.used, row.taxpayer_type]
+      .map((value) => {
+        if (value === null || value === undefined) return "";
+        const stringValue = String(value);
+        if (stringValue.includes(",") || stringValue.includes("\"")) {
+          return `"${stringValue.replace(/"/g, '""')}"`;
+        }
+        return stringValue;
+      })
+      .join(",");
+    csvLines.push(values);
+  }
+
+  return csvLines.join("\n");
+}
+
 export async function GET(req: NextRequest) {
   try {
     const params = parseSearchParams(req);
@@ -248,31 +315,13 @@ export async function GET(req: NextRequest) {
 
     const whereClause = buildWhere(params, columns);
 
+    const rawSelect = buildRawSelect(columns);
+    const rawQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
+    const rawResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(rawQuery);
+    const mappedRows = mapRows(rawResponse).map((row) => normalizeRow(row, columns));
+
     if (params.format === "csv") {
-      const rawSelect = buildRawSelect(columns);
-      const csvQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
-      const rawResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(csvQuery);
-      const rows = mapRows(rawResponse);
-      const csvLines = ["year,program,claimed,used,taxpayer_type"];
-      for (const row of rows) {
-        const yearValue = row.year ?? row[columns.year];
-        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
-        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
-        const usedValue = row.used ?? (columns.used ? row[columns.used] : undefined);
-        const taxpayerValue = row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined);
-        const values = [yearValue, programValue, claimedValue, usedValue, taxpayerValue]
-          .map((value) => {
-            if (value === null || value === undefined) return "";
-            const stringValue = String(value);
-            if (stringValue.includes(",") || stringValue.includes("\"")) {
-              return `"${stringValue.replace(/"/g, '""')}"`;
-            }
-            return stringValue;
-          })
-          .join(",");
-        csvLines.push(values);
-      }
-      const csvContent = csvLines.join("\n");
+      const csvContent = rowsToCsv(mappedRows);
       return new Response(csvContent, {
         headers: {
           "Content-Type": "text/csv; charset=utf-8",
@@ -281,119 +330,53 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    const claimedExpr = columns.claimed ? `COALESCE("${columns.claimed}", 0)` : "0";
-    const usedExpr = columns.used ? `COALESCE("${columns.used}", 0)` : "0";
+    const yearlyMap = new Map<number, { claimed: number; used: number }>();
+    const programClaimedTotals = new Map<string, number>();
+    const programOptionsSet = new Set<string>();
+    const taxpayerOptionsSet = new Set<string>();
 
-    const yearlyQuery = `SELECT "${columns.year}" AS year, SUM(${claimedExpr}) AS claimed, SUM(${usedExpr}) AS used ${
-      whereClause ? `${whereClause}` : ""
-    } GROUP BY "${columns.year}" ORDER BY "${columns.year}"`;
+    for (const row of mappedRows) {
+      const yearNumber = typeof row.year === "number" ? row.year : Number.parseInt(String(row.year), 10);
+      if (Number.isFinite(yearNumber)) {
+        const current = yearlyMap.get(yearNumber) ?? { claimed: 0, used: 0 };
+        current.claimed += row.claimed;
+        current.used += row.used;
+        yearlyMap.set(yearNumber, current);
+      }
 
-    const topProgramsQuery = columns.program
-      ? `SELECT "${columns.program}" AS program, SUM(${claimedExpr}) AS claimed ${
-          whereClause ? `${whereClause}` : ""
-        } GROUP BY "${columns.program}" ORDER BY claimed DESC LIMIT 10`
-      : undefined;
+      if (row.program && row.program !== "Unknown") {
+        programOptionsSet.add(row.program);
+      }
+      const existingProgramTotal = programClaimedTotals.get(row.program) ?? 0;
+      programClaimedTotals.set(row.program, existingProgramTotal + row.claimed);
 
-    const programsQuery = columns.program
-      ? `SELECT DISTINCT "${columns.program}" AS program ${
-          whereClause ? `${whereClause}` : ""
-        } ORDER BY program`
-      : undefined;
+      if (row.taxpayer_type) {
+        taxpayerOptionsSet.add(row.taxpayer_type);
+      }
+    }
 
-    const taxpayerTypesQuery = columns.taxpayerType
-      ? `SELECT DISTINCT "${columns.taxpayerType}" AS taxpayer_type ${
-          whereClause ? `${whereClause}` : ""
-        } ORDER BY taxpayer_type`
-      : undefined;
-
-    const [yearlyResponse, topProgramsResponse, programsResponse, taxpayerTypesResponse] = await Promise.all([
-      socrataQuery<SocrataResponse | Record<string, any>[]>(yearlyQuery),
-      topProgramsQuery
-        ? socrataQuery<SocrataResponse | Record<string, any>[]>(topProgramsQuery)
-        : Promise.resolve(null),
-      programsQuery
-        ? socrataQuery<SocrataResponse | Record<string, any>[]>(programsQuery)
-        : Promise.resolve(null),
-      taxpayerTypesQuery
-        ? socrataQuery<SocrataResponse | Record<string, any>[]>(taxpayerTypesQuery)
-        : Promise.resolve(null),
-    ]);
-
-    const yearlyRows = mapRows(yearlyResponse).map((row) => {
-      const yearValue = row.year ?? row[columns.year];
-      const claimedValue = row.claimed ?? row[columns.claimed ?? "claimed"];
-      const usedValue = row.used ?? row[columns.used ?? "used"];
-      const year = Number.parseInt(String(yearValue), 10);
-      const claimed = toNumber(claimedValue);
-      const used = toNumber(usedValue);
-      return {
+    const yearlyRows = Array.from(yearlyMap.entries())
+      .map(([year, totals]) => ({
         year,
-        claimed,
-        used,
-        utilizationPct: computeUtilization(claimed, used),
-      };
-    });
-
-    yearlyRows.sort((a, b) => a.year - b.year);
+        claimed: totals.claimed,
+        used: totals.used,
+        utilizationPct: computeUtilization(totals.claimed, totals.used),
+      }))
+      .sort((a, b) => a.year - b.year);
 
     const totalClaimed = yearlyRows.reduce((sum, row) => sum + row.claimed, 0);
     const totalUsed = yearlyRows.reduce((sum, row) => sum + row.used, 0);
 
-    const topProgramRows = topProgramsResponse ? mapRows(topProgramsResponse) : [];
-    const topPrograms = topProgramRows
-      .map((row) => {
-        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
-        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
-        return { program: programValue ?? "Unknown", claimed: toNumber(claimedValue) };
-      })
-      .filter((row) => row.program !== null && row.program !== undefined);
+    const topPrograms = Array.from(programClaimedTotals.entries())
+      .map(([program, claimed]) => ({ program, claimed }))
+      .sort((a, b) => b.claimed - a.claimed)
+      .slice(0, 10);
 
-    const programOptions = programsResponse
-      ? mapRows(programsResponse)
-          .map((row) => row.program ?? (columns.program ? row[columns.program] : undefined))
-          .filter((value) => value !== null && value !== undefined && value !== "")
-      : [];
+    const programOptions = Array.from(programOptionsSet).sort((a, b) => a.localeCompare(b));
+    const taxpayerOptions = Array.from(taxpayerOptionsSet).sort((a, b) => a.localeCompare(b));
 
-    const taxpayerOptions = taxpayerTypesResponse
-      ? mapRows(taxpayerTypesResponse)
-          .map((row) => row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined))
-          .filter((value) => value !== null && value !== undefined && value !== "")
-      : [];
-
-    let rawRows: Record<string, any>[] = [];
-    if (params.view === "raw") {
-      const rawSelect = buildRawSelect(columns);
-      const rawQuery = `${rawSelect} ${whereClause} ORDER BY "${columns.year}" DESC LIMIT 50000`;
-      const rawResponse = await socrataQuery<SocrataResponse | Record<string, any>[]>(rawQuery);
-      rawRows = mapRows(rawResponse).map((row) => {
-        const yearValue = row.year ?? row[columns.year];
-        const programValue = row.program ?? (columns.program ? row[columns.program] : undefined);
-        const claimedValue = row.claimed ?? (columns.claimed ? row[columns.claimed] : undefined);
-        const usedValue = row.used ?? (columns.used ? row[columns.used] : undefined);
-        const taxpayerValue =
-          row.taxpayer_type ?? (columns.taxpayerType ? row[columns.taxpayerType] : undefined);
-        const claimed = toNumber(claimedValue);
-        const used = toNumber(usedValue);
-        return {
-          year: yearValue,
-          program: programValue,
-          claimed,
-          used,
-          taxpayer_type: taxpayerValue,
-          utilizationPct: computeUtilization(claimed, used),
-        };
-      });
-    }
-
-    const years = yearlyRows.map((row) => row.year).filter((value) => Number.isFinite(value));
-    const minYear = years.length > 0 ? Math.min(...years) : undefined;
-    const maxYear = years.length > 0 ? Math.max(...years) : undefined;
-    const yearRange: number[] = [];
-    if (minYear !== undefined && maxYear !== undefined) {
-      for (let year = minYear; year <= maxYear; year += 1) {
-        yearRange.push(year);
-      }
-    }
+    const yearNumbers = yearlyRows.map((row) => row.year);
+    const yearRange = buildYearRange(yearNumbers);
 
     const responsePayload = {
       ok: true,
@@ -415,7 +398,7 @@ export async function GET(req: NextRequest) {
       },
       yearly: yearlyRows,
       topPrograms,
-      raw: params.view === "raw" ? rawRows : undefined,
+      raw: params.view === "raw" ? mappedRows : undefined,
     };
 
     return NextResponse.json(responsePayload);

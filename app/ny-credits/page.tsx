@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+} from "react";
 import dynamic from "next/dynamic";
 
 const YearlyStackedClaimedChart = dynamic(() => import("@/components/charts/YearlyStackedClaimed"), {
@@ -74,6 +81,7 @@ export default function NyCreditsPage() {
   const [draftFilters, setDraftFilters] = useState<FiltersState>({ programs: [] });
   const [programSearch, setProgramSearch] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const fetchData = useCallback(async (filters: FiltersState) => {
     const params = new URLSearchParams();
@@ -83,10 +91,16 @@ export default function NyCreditsPage() {
     if (filters.programs.length > 0) params.set("program", filters.programs.join(","));
     if (filters.taxpayerType) params.set("taxpayer_type", filters.taxpayerType);
 
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`/api/ny-credits?${params.toString()}`);
+      const response = await fetch(`/api/ny-credits?${params.toString()}`, {
+        signal: controller.signal,
+      });
       if (!response.ok) {
         throw new Error(`Request failed (${response.status})`);
       }
@@ -94,17 +108,39 @@ export default function NyCreditsPage() {
       if (!json.ok) {
         throw new Error("API returned an error response");
       }
+      if (controller.signal.aborted) {
+        return;
+      }
       setData(json);
     } catch (err) {
+      const isAbortError =
+        (err instanceof Error && err.name === "AbortError") ||
+        (typeof err === "object" && err !== null && "name" in err && (err as { name?: string }).name === "AbortError");
+      if (isAbortError || controller.signal.aborted) {
+        return;
+      }
       setError(err instanceof Error ? err.message : "Unexpected error");
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) {
+        setLoading(false);
+      }
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
   }, []);
 
   useEffect(() => {
     fetchData(appliedFilters);
   }, [fetchData, appliedFilters]);
+
+  useEffect(
+    () => () => {
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     if (data?.meta?.years?.length) {
@@ -187,9 +223,18 @@ export default function NyCreditsPage() {
   }, [appliedFilters]);
 
   const programsInScope = useMemo(() => {
-    if (appliedFilters.programs.length > 0) return appliedFilters.programs.length;
-    return data?.meta.programs.length ?? 0;
-  }, [appliedFilters.programs.length, data?.meta.programs.length]);
+    const rows = data?.raw ?? [];
+    if (!rows.length) {
+      return undefined;
+    }
+    const uniquePrograms = new Set<string>();
+    rows.forEach((row) => {
+      if (row.program) {
+        uniquePrograms.add(row.program);
+      }
+    });
+    return uniquePrograms.size;
+  }, [data?.raw]);
 
   const stackedChartData = useMemo(() => {
     if (!data?.raw || !data.topPrograms?.length) return [];
@@ -388,7 +433,10 @@ export default function NyCreditsPage() {
               <KpiCard label="Claimed" value={CURRENCY_FORMATTER.format(data.totals.claimed)} />
               <KpiCard label="Used" value={CURRENCY_FORMATTER.format(data.totals.used)} />
               <KpiCard label="Utilization" value={formatPercent(data.totals.utilizationPct)} />
-              <KpiCard label="Programs in scope" value={programsInScope.toString()} />
+              <KpiCard
+                label="Programs in scope"
+                value={programsInScope !== undefined ? programsInScope.toString() : "–"}
+              />
             </section>
 
             <section className="grid gap-6 lg:grid-cols-2">
